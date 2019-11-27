@@ -1,6 +1,7 @@
 // Copyright (c) Microsoft Corporation. All rights reserved.
 // Licensed under the MIT License.
 #include <algorithm>
+#include <array>
 #include <iostream>
 #include <vector>
 #include <string>
@@ -61,10 +62,8 @@ int main(int argc, char **argv)
     int32_t color_exposure_usec = 8000;  // somewhat reasonable default exposure time
     int32_t powerline_freq = 2;          // default to a 60 Hz powerline
     cv::Size chessboard_pattern(0, 0);   // height, width. Both need to be set.
-    uint16_t depth_threshold = 1000;     // default to 1 meter
     size_t num_devices = 0;
     double calibration_timeout = 60.0; // default to timing out after 60s of trying to get calibrated
-    double greenscreen_duration = std::numeric_limits<double>::max(); // run forever
 
     vector<uint32_t> device_indices{ 0 }; // Set up a MultiDeviceCapturer to handle getting many synchronous captures
                                           // Note that the order of indices in device_indices is not necessarily
@@ -75,9 +74,8 @@ int main(int argc, char **argv)
     if (argc < 5)
     {
         cout << "Usage: tango <num-cameras> <board-height> <board-width> <board-square-length> "
-                "[depth-threshold-mm (default 1000)] [color-exposure-time-usec (default 8000)] "
+                "[color-exposure-time-usec (default 8000)] "
                 "[powerline-frequency-mode (default 2 for 60 Hz)] [calibration-timeout-sec (default 60)]"
-                "[greenscreen-duration-sec (default infinity- run forever)]"
              << endl;
 
         cerr << "Not enough arguments!\n";
@@ -97,21 +95,13 @@ int main(int argc, char **argv)
 
         if (argc > 5)
         {
-            depth_threshold = static_cast<uint16_t>(atoi(argv[5]));
+            color_exposure_usec = atoi(argv[5]);
             if (argc > 6)
             {
-                color_exposure_usec = atoi(argv[6]);
+                powerline_freq = atoi(argv[6]);
                 if (argc > 7)
                 {
-                    powerline_freq = atoi(argv[7]);
-                    if (argc > 8)
-                    {
-                        calibration_timeout = atof(argv[8]);
-                        if (argc > 9)
-                        {
-                            greenscreen_duration = atof(argv[9]);
-                        }
-                    }
+                    calibration_timeout = atof(argv[7]);
                 }
             }
         }
@@ -144,8 +134,7 @@ int main(int argc, char **argv)
 
     cout << "Chessboard height: " << chessboard_pattern.height << ". Chessboard width: " << chessboard_pattern.width
          << ". Chessboard square length: " << chessboard_square_length << endl;
-    cout << "Depth threshold: : " << depth_threshold << ". Color exposure time: " << color_exposure_usec
-         << ". Powerline frequency mode: " << powerline_freq << endl;
+    cout << "Color exposure time: " << color_exposure_usec << ". Powerline frequency mode: " << powerline_freq << endl;
 
     MultiDeviceCapturer capturer(device_indices, color_exposure_usec, powerline_freq);
 
@@ -174,9 +163,12 @@ int main(int argc, char **argv)
 
     if (num_devices == 1)
     {
-        std::chrono::time_point<std::chrono::system_clock> start_time = std::chrono::system_clock::now();
-        while (std::chrono::duration<double>(std::chrono::system_clock::now() - start_time).count() <
-               greenscreen_duration)
+        const size_t N_FRAMES = 5 * 30;
+        std::array<std::pair<cv::Mat, cv::Mat>, N_FRAMES> frames;
+        size_t iFrame = 0;
+        bool looped = false;
+        bool stop = false;
+        while (!stop)
         {
             vector<k4a::capture> captures;
             // secondary_config isn't actually used here because there's no secondary device but the function needs it
@@ -184,23 +176,44 @@ int main(int argc, char **argv)
             k4a::image main_color_image = captures[0].get_color_image();
             k4a::image main_depth_image = captures[0].get_depth_image();
 
-            // let's green screen out things that are far away.
             // first: let's get the main depth image into the color camera space
             k4a::image main_depth_in_main_color = create_depth_image_like(main_color_image);
             main_depth_to_main_color.depth_image_to_color_camera(main_depth_image, &main_depth_in_main_color);
             cv::Mat cv_main_depth_in_main_color = depth_to_opencv(main_depth_in_main_color);
             cv::Mat cv_main_color_image = color_to_opencv(main_color_image);
 
-            // single-camera case
-            cv::Mat within_threshold_range = (cv_main_depth_in_main_color != 0) &
-                                             (cv_main_depth_in_main_color < depth_threshold);
-            // show the close details
-            cv_main_color_image.copyTo(output_image, within_threshold_range);
-            // hide the rest with the background image
-            background_image.copyTo(output_image, ~within_threshold_range);
+            if (!looped)
+            {
+                // just store the frame
+                frames[iFrame] = std::make_pair(cv_main_color_image.clone(), cv_main_depth_in_main_color.clone());
+                if (iFrame == N_FRAMES-1)
+                {
+                    looped = true;
+                }
+            }
+            else
+            {
+                // store the pixels that are in front of the stored depth (or where the stored frame had no valid depth)
+                cv::Mat in_front_of_frame = (frames[iFrame].second == 0) |
+                                            ((cv_main_depth_in_main_color != 0) &
+                                             (cv_main_depth_in_main_color < frames[iFrame].second));
+                cv_main_color_image.copyTo(frames[iFrame].first, in_front_of_frame);
+                cv_main_depth_in_main_color.copyTo(frames[iFrame].second, in_front_of_frame);
+            }
 
-            cv::imshow("Tango", output_image);
-            cv::waitKey(1);
+            cv::imshow("Tango - Esc to quit - SPACE to reset", frames[iFrame].first);
+            iFrame = (iFrame + 1) % N_FRAMES;
+
+            int key = cv::waitKey(1) % 256;
+            if (key == 27)
+            {
+                stop = true;
+            }
+            else if (key == ' ')
+            {
+                looped = false; // reset
+                iFrame = 0;
+            }
         }
     }
     else if (num_devices == 2)
@@ -233,9 +246,7 @@ int main(int argc, char **argv)
                                                    tr_secondary_depth_to_main_color);
         k4a::transformation secondary_depth_to_main_color(secondary_depth_to_main_color_cal);
 
-        std::chrono::time_point<std::chrono::system_clock> start_time = std::chrono::system_clock::now();
-        while (std::chrono::duration<double>(std::chrono::system_clock::now() - start_time).count() <
-               greenscreen_duration)
+        do
         {
             vector<k4a::capture> captures;
             captures = capturer.get_synchronized_captures(secondary_config, true);
@@ -265,17 +276,14 @@ int main(int argc, char **argv)
             // build depth mask. If the main camera depth for a pixel is valid and the depth is within the threshold,
             // then set the mask to display that pixel. If the main camera depth for a pixel is invalid but the
             // secondary depth for a pixel is valid and within the threshold, then set the mask to display that pixel.
-            cv::Mat within_threshold_range = (main_valid_mask & (cv_main_depth_in_main_color < depth_threshold)) |
-                                             (~main_valid_mask & secondary_valid_mask &
-                                              (cv_secondary_depth_in_main_color < depth_threshold));
+            cv::Mat within_threshold_range = (main_valid_mask) | (~main_valid_mask & secondary_valid_mask);
             // copy main color image to output image only where the mask within_threshold_range is true
             cv_main_color_image.copyTo(output_image, within_threshold_range);
             // fill the rest with the background image
             background_image.copyTo(output_image, ~within_threshold_range);
 
-            cv::imshow("Green Screen", output_image);
-            cv::waitKey(1);
-        }
+            cv::imshow("Tango", output_image);
+        } while (cv::waitKey(1) != 27);
     }
     else
     {
