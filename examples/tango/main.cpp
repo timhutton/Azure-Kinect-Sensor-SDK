@@ -161,13 +161,13 @@ int main(int argc, char **argv)
     cv::Mat background_image = color_to_opencv(background_captures[0].get_color_image());
     cv::Mat output_image = background_image.clone(); // allocated outside the loop to avoid re-creating every time
 
+    const size_t N_FRAMES = 3 * 30;
+    std::array<std::pair<cv::Mat, cv::Mat>, N_FRAMES> frames;
+    size_t iFrame = 0;
+    bool looped = false;
+    bool stop = false;
     if (num_devices == 1)
     {
-        const size_t N_FRAMES = 5 * 30;
-        std::array<std::pair<cv::Mat, cv::Mat>, N_FRAMES> frames;
-        size_t iFrame = 0;
-        bool looped = false;
-        bool stop = false;
         while (!stop)
         {
             vector<k4a::capture> captures;
@@ -186,7 +186,7 @@ int main(int argc, char **argv)
             {
                 // just store the frame
                 frames[iFrame] = std::make_pair(cv_main_color_image.clone(), cv_main_depth_in_main_color.clone());
-                if (iFrame == N_FRAMES-1)
+                if (iFrame == N_FRAMES - 1)
                 {
                     looped = true;
                 }
@@ -246,14 +246,13 @@ int main(int argc, char **argv)
                                                    tr_secondary_depth_to_main_color);
         k4a::transformation secondary_depth_to_main_color(secondary_depth_to_main_color_cal);
 
-        do
+        while (!stop)
         {
             vector<k4a::capture> captures;
             captures = capturer.get_synchronized_captures(secondary_config, true);
             k4a::image main_color_image = captures[0].get_color_image();
             k4a::image main_depth_image = captures[0].get_depth_image();
 
-            // let's green screen out things that are far away.
             // first: let's get the main depth image into the color camera space
             k4a::image main_depth_in_main_color = create_depth_image_like(main_color_image);
             main_depth_to_main_color.depth_image_to_color_camera(main_depth_image, &main_depth_in_main_color);
@@ -268,22 +267,48 @@ int main(int argc, char **argv)
                                                                       &secondary_depth_in_main_color);
             cv::Mat cv_secondary_depth_in_main_color = depth_to_opencv(secondary_depth_in_main_color);
 
-            // Now it's time to actually construct the green screen. Where the depth is 0, the camera doesn't know how
-            // far away the object is because it didn't get a response at that point. That's where we'll try to fill in
-            // the gaps with the other camera.
+            // Where the depth is 0, the camera doesn't know how far away the object is because
+            // it didn't get a response at that point. That's where we'll try to fill in the gaps
+            // with the other camera.
             cv::Mat main_valid_mask = cv_main_depth_in_main_color != 0;
             cv::Mat secondary_valid_mask = cv_secondary_depth_in_main_color != 0;
-            // build depth mask. If the main camera depth for a pixel is valid and the depth is within the threshold,
-            // then set the mask to display that pixel. If the main camera depth for a pixel is invalid but the
-            // secondary depth for a pixel is valid and within the threshold, then set the mask to display that pixel.
-            cv::Mat within_threshold_range = (main_valid_mask) | (~main_valid_mask & secondary_valid_mask);
-            // copy main color image to output image only where the mask within_threshold_range is true
-            cv_main_color_image.copyTo(output_image, within_threshold_range);
-            // fill the rest with the background image
-            background_image.copyTo(output_image, ~within_threshold_range);
+            cv::Mat copy_to_main_mask = (~main_valid_mask & secondary_valid_mask);
+            // Merge the two depth images in the master camera color space
+            cv_secondary_depth_in_main_color.copyTo(cv_main_depth_in_main_color, copy_to_main_mask);
 
-            cv::imshow("Tango", output_image);
-        } while (cv::waitKey(1) != 27);
+            if (!looped)
+            {
+                // just store the frame
+                frames[iFrame] = std::make_pair(cv_main_color_image.clone(), cv_main_depth_in_main_color.clone());
+                if (iFrame == N_FRAMES - 1)
+                {
+                    looped = true;
+                }
+            }
+            else
+            {
+                // store the pixels that are in front of the stored depth (or where the stored frame had no valid depth)
+                cv::Mat in_front_of_frame = (frames[iFrame].second == 0) |
+                                            ((cv_main_depth_in_main_color != 0) &
+                                             (cv_main_depth_in_main_color < frames[iFrame].second));
+                cv_main_color_image.copyTo(frames[iFrame].first, in_front_of_frame);
+                cv_main_depth_in_main_color.copyTo(frames[iFrame].second, in_front_of_frame);
+            }
+
+            cv::imshow("Tango - Esc to quit - SPACE to reset", frames[iFrame].first);
+            iFrame = (iFrame + 1) % N_FRAMES;
+
+            int key = cv::waitKey(1) % 256;
+            if (key == 27)
+            {
+                stop = true;
+            }
+            else if (key == ' ')
+            {
+                looped = false; // reset
+                iFrame = 0;
+            }
+        }
     }
     else
     {
